@@ -1,0 +1,440 @@
+"""
+SparseCycleTransformer 专用训练实验类
+
+实现三部分联合损失函数:
+1. 主预测损失 (MSE)
+2. 稀疏正则化损失: 鼓励用更少关键点完成预测
+3. 周期一致性损失: 确保语义通路与稀疏通路的选择相互印证
+"""
+from data_provider.data_factory import data_provider
+from experiments.exp_basic import Exp_Basic
+from utils.tools import EarlyStopping, adjust_learning_rate, visual
+from utils.metrics import metric
+import torch
+import torch.nn as nn
+from torch import optim
+import os
+import time
+import warnings
+import numpy as np
+
+warnings.filterwarnings('ignore')
+
+
+class Exp_SparseCycle(Exp_Basic):
+    """
+    SparseCycleTransformer 专用训练实验类
+    
+    与标准训练的主要区别:
+    1. 使用模型的 get_total_loss() 方法计算联合损失
+    2. 记录和打印稀疏统计信息
+    3. 支持损失权重的动态调整
+    """
+    
+    def __init__(self, args):
+        super(Exp_SparseCycle, self).__init__(args)
+
+    def _build_model(self):
+        model = self.model_dict[self.args.model].Model(self.args).float()
+
+        if self.args.use_multi_gpu and self.args.use_gpu:
+            model = nn.DataParallel(model, device_ids=self.args.device_ids)
+        return model
+
+    def _get_data(self, flag):
+        data_set, data_loader = data_provider(self.args, flag)
+        return data_set, data_loader
+
+    def _select_optimizer(self):
+        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        return model_optim
+
+    def _select_criterion(self):
+        criterion = nn.MSELoss()
+        return criterion
+
+    def vali(self, vali_data, vali_loader, criterion):
+        total_loss = []
+        total_pred_loss = []
+        total_sparse_loss = []
+        total_period_loss = []
+        
+        self.model.eval()
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float().to(self.device)
+                if 'PEMS' in self.args.data or 'Solar' in self.args.data:
+                    batch_x_mark = None
+                    batch_y_mark = None
+                else:
+                    batch_x_mark = batch_x_mark.float().to(self.device)
+                    batch_y_mark = batch_y_mark.float().to(self.device)
+
+                # decoder input
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                
+                # encoder - decoder
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                else:
+                    if self.args.output_attention:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    else:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                
+                f_dim = -1 if self.args.features == 'MS' else 0
+                outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+
+                pred = outputs.detach().cpu()
+                true = batch_y.detach().cpu()
+
+                # 计算预测损失
+                pred_loss = criterion(pred, true)
+                
+                # 计算总损失 (包括辅助损失)
+                if hasattr(self.model, 'get_total_loss'):
+                    if hasattr(self.model, 'module'):  # DataParallel
+                        total, loss_dict = self.model.module.get_total_loss(pred_loss)
+                    else:
+                        total, loss_dict = self.model.get_total_loss(pred_loss)
+                    total_loss.append(total.item() if hasattr(total, 'item') else total)
+                    total_pred_loss.append(loss_dict['pred_loss'])
+                    total_sparse_loss.append(loss_dict['sparse_loss'])
+                    total_period_loss.append(loss_dict['period_loss'])
+                else:
+                    total_loss.append(pred_loss.item())
+                    total_pred_loss.append(pred_loss.item())
+                    
+        avg_total_loss = np.average(total_loss)
+        avg_pred_loss = np.average(total_pred_loss) if total_pred_loss else 0
+        avg_sparse_loss = np.average(total_sparse_loss) if total_sparse_loss else 0
+        avg_period_loss = np.average(total_period_loss) if total_period_loss else 0
+        
+        self.model.train()
+        return avg_total_loss, avg_pred_loss, avg_sparse_loss, avg_period_loss
+
+    def train(self, setting):
+        train_data, train_loader = self._get_data(flag='train')
+        vali_data, vali_loader = self._get_data(flag='val')
+        test_data, test_loader = self._get_data(flag='test')
+
+        path = os.path.join(self.args.checkpoints, setting)
+        if not os.path.exists(path):
+            os.makedirs(path)
+
+        time_now = time.time()
+
+        train_steps = len(train_loader)
+        early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
+
+        model_optim = self._select_optimizer()
+        criterion = self._select_criterion()
+
+        if self.args.use_amp:
+            scaler = torch.cuda.amp.GradScaler()
+
+        for epoch in range(self.args.train_epochs):
+            iter_count = 0
+            train_loss = []
+            train_pred_loss = []
+            train_sparse_loss = []
+            train_period_loss = []
+
+            self.model.train()
+            epoch_time = time.time()
+            
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+                iter_count += 1
+                model_optim.zero_grad()
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float().to(self.device)
+                if 'PEMS' in self.args.data or 'Solar' in self.args.data:
+                    batch_x_mark = None
+                    batch_y_mark = None
+                else:
+                    batch_x_mark = batch_x_mark.float().to(self.device)
+                    batch_y_mark = batch_y_mark.float().to(self.device)
+
+                # decoder input
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+
+                # encoder - decoder
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+                        f_dim = -1 if self.args.features == 'MS' else 0
+                        outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                        
+                        # 计算预测损失
+                        pred_loss = criterion(outputs, batch_y)
+                        
+                        # 计算总损失 (包括辅助损失)
+                        if hasattr(self.model, 'get_total_loss'):
+                            if hasattr(self.model, 'module'):  # DataParallel
+                                loss, loss_dict = self.model.module.get_total_loss(pred_loss)
+                            else:
+                                loss, loss_dict = self.model.get_total_loss(pred_loss)
+                            train_pred_loss.append(loss_dict['pred_loss'])
+                            train_sparse_loss.append(loss_dict['sparse_loss'])
+                            train_period_loss.append(loss_dict['period_loss'])
+                        else:
+                            loss = pred_loss
+                            train_pred_loss.append(pred_loss.item())
+                            
+                        train_loss.append(loss.item())
+                else:
+                    if self.args.output_attention:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    else:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+                    f_dim = -1 if self.args.features == 'MS' else 0
+                    outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                    
+                    # 计算预测损失
+                    pred_loss = criterion(outputs, batch_y)
+                    
+                    # 计算总损失 (包括辅助损失)
+                    if hasattr(self.model, 'get_total_loss'):
+                        if hasattr(self.model, 'module'):  # DataParallel
+                            loss, loss_dict = self.model.module.get_total_loss(pred_loss)
+                        else:
+                            loss, loss_dict = self.model.get_total_loss(pred_loss)
+                        train_pred_loss.append(loss_dict['pred_loss'])
+                        train_sparse_loss.append(loss_dict['sparse_loss'])
+                        train_period_loss.append(loss_dict['period_loss'])
+                    else:
+                        loss = pred_loss
+                        train_pred_loss.append(pred_loss.item())
+                        
+                    train_loss.append(loss.item())
+
+                if (i + 1) % 100 == 0:
+                    # 打印详细损失信息
+                    avg_pred = np.average(train_pred_loss[-100:]) if train_pred_loss else 0
+                    avg_sparse = np.average(train_sparse_loss[-100:]) if train_sparse_loss else 0
+                    avg_period = np.average(train_period_loss[-100:]) if train_period_loss else 0
+                    
+                    print("\titers: {0}, epoch: {1} | total_loss: {2:.7f} | pred_loss: {3:.7f} | sparse_loss: {4:.7f} | period_loss: {5:.7f}".format(
+                        i + 1, epoch + 1, loss.item(), avg_pred, avg_sparse, avg_period))
+                    
+                    # 打印稀疏统计信息
+                    if hasattr(self.model, 'get_sparsity_stats'):
+                        if hasattr(self.model, 'module'):
+                            stats = self.model.module.get_sparsity_stats()
+                        else:
+                            stats = self.model.get_sparsity_stats()
+                        if stats:
+                            print("\t[Sparsity] active_ratio: {:.4f} | actual_sparsity: {:.4f} | num_active: {:.1f}".format(
+                                stats.get('active_ratio', 0), 
+                                stats.get('actual_sparsity', 0),
+                                stats.get('num_active_points', 0)))
+                    
+                    speed = (time.time() - time_now) / iter_count
+                    left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
+                    print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                    iter_count = 0
+                    time_now = time.time()
+
+                if self.args.use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.step(model_optim)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    model_optim.step()
+
+            print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+            
+            # 计算平均损失
+            train_loss_avg = np.average(train_loss)
+            train_pred_avg = np.average(train_pred_loss) if train_pred_loss else 0
+            train_sparse_avg = np.average(train_sparse_loss) if train_sparse_loss else 0
+            train_period_avg = np.average(train_period_loss) if train_period_loss else 0
+            
+            # 验证
+            vali_loss, vali_pred, vali_sparse, vali_period = self.vali(vali_data, vali_loader, criterion)
+            test_loss, test_pred, test_sparse, test_period = self.vali(test_data, test_loader, criterion)
+
+            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
+                epoch + 1, train_steps, train_loss_avg, vali_loss, test_loss))
+            print("  [Detail] Train: pred={:.5f} sparse={:.5f} period={:.5f}".format(
+                train_pred_avg, train_sparse_avg, train_period_avg))
+            print("  [Detail] Vali:  pred={:.5f} sparse={:.5f} period={:.5f}".format(
+                vali_pred, vali_sparse, vali_period))
+            
+            # 使用预测损失进行早停
+            early_stopping(vali_pred, self.model, path)
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
+
+            adjust_learning_rate(model_optim, epoch + 1, self.args)
+
+        best_model_path = path + '/' + 'checkpoint.pth'
+        self.model.load_state_dict(torch.load(best_model_path))
+
+        return self.model
+
+    def test(self, setting, test=0):
+        test_data, test_loader = self._get_data(flag='test')
+        if test:
+            print('loading model')
+            self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
+
+        preds = []
+        trues = []
+        folder_path = './test_results/' + setting + '/'
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        self.model.eval()
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float().to(self.device)
+
+                if 'PEMS' in self.args.data or 'Solar' in self.args.data:
+                    batch_x_mark = None
+                    batch_y_mark = None
+                else:
+                    batch_x_mark = batch_x_mark.float().to(self.device)
+                    batch_y_mark = batch_y_mark.float().to(self.device)
+
+                # decoder input
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                
+                # encoder - decoder
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                else:
+                    if self.args.output_attention:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    else:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+                f_dim = -1 if self.args.features == 'MS' else 0
+                outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                outputs = outputs.detach().cpu().numpy()
+                batch_y = batch_y.detach().cpu().numpy()
+                
+                if test_data.scale and self.args.inverse:
+                    shape = outputs.shape
+                    outputs = test_data.inverse_transform(outputs.squeeze(0)).reshape(shape)
+                    batch_y = test_data.inverse_transform(batch_y.squeeze(0)).reshape(shape)
+
+                pred = outputs
+                true = batch_y
+
+                preds.append(pred)
+                trues.append(true)
+                
+                if i % 20 == 0:
+                    input = batch_x.detach().cpu().numpy()
+                    if test_data.scale and self.args.inverse:
+                        shape = input.shape
+                        input = test_data.inverse_transform(input.squeeze(0)).reshape(shape)
+                    gt = np.concatenate((input[0, :, -1], true[0, :, -1]), axis=0)
+                    pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
+                    visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
+
+        preds = np.array(preds)
+        trues = np.array(trues)
+        print('test shape:', preds.shape, trues.shape)
+        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
+        trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
+        print('test shape:', preds.shape, trues.shape)
+
+        # result save
+        folder_path = './results/' + setting + '/'
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        mae, mse, rmse, mape, mspe = metric(preds, trues)
+        print('mse:{}, mae:{}'.format(mse, mae))
+        
+        f = open("result_sparse_cycle.txt", 'a')
+        f.write(setting + "  \n")
+        f.write('mse:{}, mae:{}'.format(mse, mae))
+        f.write('\n')
+        f.write('\n')
+        f.close()
+
+        np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe]))
+        np.save(folder_path + 'pred.npy', preds)
+        np.save(folder_path + 'true.npy', trues)
+
+        return
+
+    def predict(self, setting, load=False):
+        pred_data, pred_loader = self._get_data(flag='pred')
+
+        if load:
+            path = os.path.join(self.args.checkpoints, setting)
+            best_model_path = path + '/' + 'checkpoint.pth'
+            self.model.load_state_dict(torch.load(best_model_path))
+
+        preds = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(pred_loader):
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+
+                # decoder input
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                
+                # encoder - decoder
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                else:
+                    if self.args.output_attention:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    else:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        
+                outputs = outputs.detach().cpu().numpy()
+                if pred_data.scale and self.args.inverse:
+                    shape = outputs.shape
+                    outputs = pred_data.inverse_transform(outputs.squeeze(0)).reshape(shape)
+                preds.append(outputs)
+
+        preds = np.array(preds)
+        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
+
+        # result save
+        folder_path = './results/' + setting + '/'
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        np.save(folder_path + 'real_prediction.npy', preds)
+
+        return
